@@ -28,7 +28,7 @@ constexpr bool kDisableDeepSleep = true;
 // Temporary diagnostics mode: keep battery operation behaving like external mode while still reporting the true D0 state.
 constexpr bool kForceExternalBehaviorForBatteryDiagnostics = true;
 
-constexpr size_t kLogCapacity = 8192;
+constexpr size_t kLogCapacity = 279620;
 
 constexpr char kApSsid[] = "CO2-Logger-Setup";
 constexpr char kApPassword[] = "co2logger";

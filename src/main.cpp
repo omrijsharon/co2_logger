@@ -545,6 +545,86 @@ String buildRecentLogsJson(size_t maxRecords) {
   return json;
 }
 
+size_t parseQuerySizeT(const String& argName, size_t defaultValue) {
+  if (!gServer.hasArg(argName)) {
+    return defaultValue;
+  }
+
+  const String raw = gServer.arg(argName);
+  if (raw.length() == 0) {
+    return defaultValue;
+  }
+
+  const long parsed = raw.toInt();
+  if (parsed < 0) {
+    return defaultValue;
+  }
+  return static_cast<size_t>(parsed);
+}
+
+size_t historyStartIndexForRange(uint32_t cutoffTimestamp) {
+  const size_t available = gStorageState.count;
+  if (available == 0 || cutoffTimestamp == 0) {
+    return 0;
+  }
+
+  size_t start = available;
+  for (size_t index = available; index > 0; --index) {
+    LogEntry entry{};
+    if (!readLogEntry(index - 1, entry)) {
+      continue;
+    }
+    if (entry.timestamp < cutoffTimestamp) {
+      break;
+    }
+    start = index - 1;
+  }
+
+  return start == available ? available : start;
+}
+
+void sendHistoryJson(size_t startIndex, size_t matchingCount, size_t maxPoints) {
+  gServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  gServer.send(200, "application/json", "");
+  gServer.sendContent("[");
+
+  if (matchingCount == 0) {
+    gServer.sendContent("]");
+    return;
+  }
+
+  const size_t pointsToSend = maxPoints == 0 ? matchingCount : min(matchingCount, maxPoints);
+  bool first = true;
+  size_t lastLogicalIndex = static_cast<size_t>(-1);
+
+  for (size_t pointIndex = 0; pointIndex < pointsToSend; ++pointIndex) {
+    size_t logicalIndex = startIndex;
+    if (pointsToSend == 1) {
+      logicalIndex = startIndex + matchingCount - 1;
+    } else {
+      logicalIndex = startIndex + ((matchingCount - 1) * pointIndex) / (pointsToSend - 1);
+    }
+
+    if (logicalIndex == lastLogicalIndex) {
+      continue;
+    }
+    lastLogicalIndex = logicalIndex;
+
+    LogEntry entry{};
+    if (!readLogEntry(logicalIndex, entry)) {
+      continue;
+    }
+
+    if (!first) {
+      gServer.sendContent(",");
+    }
+    first = false;
+    gServer.sendContent(recordToJson(entry));
+  }
+
+  gServer.sendContent("]");
+}
+
 void handleRoot() {
   static const char kPage[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -671,6 +751,21 @@ void handleRoot() {
     <section class="panel">
       <div class="toolbar">
         <strong>History</strong>
+        <select id="history-range">
+          <option value="600">10 minutes</option>
+          <option value="1800">30 minutes</option>
+          <option value="3600" selected>1 hour</option>
+          <option value="14400">4 hours</option>
+          <option value="28800">8 hours</option>
+          <option value="43200">12 hours</option>
+          <option value="86400">24 hours</option>
+          <option value="172800">2 days</option>
+          <option value="345600">4 days</option>
+          <option value="604800">7 days</option>
+          <option value="1209600">2 weeks</option>
+          <option value="2592000">1 month</option>
+          <option value="0">All history</option>
+        </select>
         <a class="button" href="/api/export.csv">Download CSV</a>
       </div>
       <div class="chart-grid">
@@ -699,6 +794,7 @@ void handleRoot() {
     let co2Chart;
     let tempChart;
     let humidityChart;
+    let selectedRangeSeconds = 3600;
     let lastPhoneTimePostMs = 0;
     let phoneTimeInFlight = false;
 
@@ -785,7 +881,7 @@ void handleRoot() {
     }
 
     async function loadLogs() {
-      const logs = await fetch('/api/logs').then(r => r.json());
+      const logs = await fetch(`/api/logs?range_seconds=${selectedRangeSeconds}&max_points=2000`).then(r => r.json());
       const co2 = logs.map(x => ({ x: x.timestamp, y: x.co2 }));
       const temperatures = logs.map(x => ({ x: x.timestamp, y: x.temperature_c }));
       const humidities = logs.map(x => ({ x: x.timestamp, y: x.humidity_percent }));
@@ -807,8 +903,22 @@ void handleRoot() {
       await Promise.all([loadLive(), loadLogs()]);
     }
 
+    async function refreshLiveOnly() {
+      await loadLive();
+    }
+
+    async function refreshHistoryOnly() {
+      await loadLogs();
+    }
+
+    document.getElementById('history-range').addEventListener('change', async (event) => {
+      selectedRangeSeconds = Number(event.target.value);
+      await loadLogs();
+    });
+
     refresh();
-    setInterval(refresh, 5000);
+    setInterval(refreshLiveOnly, 5000);
+    setInterval(refreshHistoryOnly, 60000);
   </script>
 </body>
 </html>
@@ -822,7 +932,17 @@ void handleLive() {
 }
 
 void handleLogs() {
-  gServer.send(200, "application/json", buildRecentLogsJson(256));
+  const size_t maxPoints = max<size_t>(1, parseQuerySizeT("max_points", 2000));
+  const size_t rangeSeconds = parseQuerySizeT("range_seconds", 3600);
+  const uint32_t now = toUnixTime();
+  const uint32_t cutoff = (rangeSeconds == 0 || now == 0 || rangeSeconds >= now)
+                            ? 0
+                            : now - static_cast<uint32_t>(rangeSeconds);
+  const size_t startIndex = historyStartIndexForRange(cutoff);
+  const size_t available = gStorageState.count;
+  const size_t matchingCount = startIndex >= available ? 0 : available - startIndex;
+
+  sendHistoryJson(startIndex, matchingCount, maxPoints);
 }
 
 void handleDevMode() {
